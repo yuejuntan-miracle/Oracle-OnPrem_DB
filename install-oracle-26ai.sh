@@ -20,6 +20,7 @@
 #     sudo ./install-oracle-26ai.sh                 # install / re-run safely
 #     sudo ./install-oracle-26ai.sh --status        # show component status
 #     sudo ./install-oracle-26ai.sh --patch-network # re-apply vLLM ACL + test only
+#     sudo ./install-oracle-26ai.sh --diagnose      # print what is needed to debug a failure
 #     sudo ./install-oracle-26ai.sh --uninstall     # remove everything (asks)
 #     sudo ./install-oracle-26ai.sh --uninstall --yes
 #
@@ -114,6 +115,14 @@ on_error() {
 trap 'on_error $LINENO' ERR
 
 done_mark() { mkdir -p "$STATE_DIR"; echo "${2:-done} $(ts)" > "${STATE_DIR}/$1.done"; }
+free_gb()   { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
+
+# Only one copy of the script may run at a time (a second run would delete
+# the APEX staging folder under a running apexins.sql).
+take_lock() {
+  exec 9>/var/lock/oracle-26ai-install.lock
+  flock -n 9 || die "Another run of this script is in progress (lock /var/lock/oracle-26ai-install.lock). Wait for it to finish."
+}
 
 # Password that Oracle, APEX and the shell all accept: starts with a letter,
 # contains upper/lower/digit, only letters, digits, '_' and '#'.
@@ -167,13 +176,23 @@ preflight() {
     *) die "Unsupported architecture $(uname -m). Need x86_64 or aarch64." ;;
   esac
 
-  local mem_kb disk_gb
+  local mem_kb disk_gb docker_gb need_gb=15
   mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
   (( mem_kb >= 3500000 )) || warn "Less than ~4 GB RAM detected ($((mem_kb/1024)) MB). DB + ORDS may struggle."
   mkdir -p "$ORACLE_BASE_DIR"
-  disk_gb=$(df -BG --output=avail "$ORACLE_BASE_DIR" | tail -1 | tr -dc '0-9')
-  (( disk_gb >= 20 )) || die "Need at least 20 GB free under ${ORACLE_BASE_DIR} (have ${disk_gb} GB)."
-  ok "OS ${PRETTY_NAME:-?}, $(uname -m), RAM $((mem_kb/1024)) MB, free disk ${disk_gb} GB"
+
+  # Space needed: database files + APEX (~10 GB after APEX install), stage,
+  # ORDS, plus ~10 GB for the database image if it is not pulled yet.
+  if ! { command -v docker >/dev/null 2>&1 && docker image inspect "$DB_IMAGE" >/dev/null 2>&1; }; then
+    need_gb=25
+  fi
+  disk_gb=$(free_gb "$ORACLE_BASE_DIR")
+  docker_gb=$(free_gb /var/lib)
+  (( disk_gb >= need_gb )) \
+    || die "Need at least ${need_gb} GB free under ${ORACLE_BASE_DIR} (have ${disk_gb} GB). Free space or grow the disk (see README)."
+  (( docker_gb >= need_gb - 5 )) \
+    || die "Need at least $((need_gb - 5)) GB free under /var/lib (Docker images), have ${docker_gb} GB."
+  ok "OS ${PRETTY_NAME:-?}, $(uname -m), RAM $((mem_kb/1024)) MB, free disk ${disk_gb} GB (need ${need_gb})"
 }
 
 load_or_create_credentials() {
@@ -349,8 +368,75 @@ SQL
   done_mark database
 }
 
+APEX_LOG_DIR="/var/log/oracle-26ai/apex"
+
+save_apex_logs() {
+  mkdir -p "$APEX_LOG_DIR"
+  compgen -G "${STAGE_DIR}/apex/*.log" >/dev/null && cp -p "${STAGE_DIR}"/apex/*.log "$APEX_LOG_DIR"/ 2>/dev/null || true
+  [[ -f "${STATE_DIR}/apexins.out" ]] && cp -p "${STATE_DIR}/apexins.out" "$APEX_LOG_DIR"/ || true
+}
+
+apex_failure_report() {
+  echo "-------------------- APEX failure report --------------------" >&2
+  echo "Exit code      : ${1:-?}" >&2
+  echo "Free disk      : $(free_gb "$ORADATA_DIR") GB under ${ORADATA_DIR}" >&2
+  df -h "$ORADATA_DIR" /var/lib 2>/dev/null >&2 || true
+  local out="${STATE_DIR}/apexins.out" newest
+  newest=$(ls -t "$APEX_LOG_DIR"/install*.log 2>/dev/null | head -1 || true)
+  for f in "$out" "$newest"; do
+    [[ -n "$f" && -f "$f" ]] || continue
+    echo "--- distinct errors in $f:" >&2
+    grep -hoE '(ORA|SP2|PLS)-[0-9]{4,5}[^"]{0,100}' "$f" | sort | uniq -c | sort -rn | head -15 >&2 || true
+    echo "--- last lines of $f:" >&2
+    tail -15 "$f" >&2
+  done
+  if grep -qsE 'ORA-0165[0-9]|ORA-01688|ORA-01691|ORA-19502|No space left|SP2-0308' "$out" "$newest" 2>/dev/null; then
+    echo ">>> Looks like the disk ran out of space. Free/grow the disk and re-run." >&2
+  fi
+  echo "Logs kept in   : ${APEX_LOG_DIR}" >&2
+  echo "--------------------------------------------------------------" >&2
+}
+
+diagnose() {
+  echo "===== host"; . /etc/os-release; echo "${PRETTY_NAME}  $(uname -m)  $(nproc) CPU"
+  free -h | head -2
+  df -h / "$ORACLE_BASE_DIR" /var/lib 2>/dev/null | awk '!seen[$0]++'
+  echo "===== running copies of this script"
+  pgrep -af 'install-oracle-26ai' | grep -v "$$" || echo none
+  echo "===== containers"
+  docker ps -a --format '{{.Names}}  {{.Status}}  {{.Image}}' 2>/dev/null || echo "docker not available"
+  echo "===== ords"; systemctl is-active ords 2>/dev/null || true
+  if container_running; then
+    echo "===== database: APEX registry / tablespaces"
+    sqlplus_sysdba <<SQL || true
+set feedback off linesize 200 pagesize 100
+col comp_id for a8
+col version for a12
+col status for a10
+col tablespace_name for a12
+alter session set container=${DB_PDB};
+select comp_id, version, status from dba_registry where comp_id='APEX';
+select username, account_status from dba_users where username like 'APEX%' or username in ('FLOWS_FILES','ORDS_METADATA','ORDS_PUBLIC_USER');
+select tablespace_name, round(sum(bytes)/1024/1024) mb from dba_data_files group by tablespace_name;
+exit
+SQL
+    echo "===== database alert log (last ORA- lines)"
+    docker logs --tail 400 "$DB_CONTAINER" 2>&1 | grep -E 'ORA-|error' | tail -10 || true
+  fi
+  echo "===== APEX logs"
+  ls -lt "$APEX_LOG_DIR" 2>/dev/null | head -5 || true
+  local newest; newest=$(ls -t "$APEX_LOG_DIR"/install*.log "${STAGE_DIR}"/apex/install*.log 2>/dev/null | head -1 || true)
+  if [[ -n "$newest" ]]; then
+    echo "--- distinct errors in $newest"
+    grep -hoE '(ORA|SP2|PLS)-[0-9]{4,5}[^"]{0,100}' "$newest" | sort | uniq -c | sort -rn | head -15 || true
+  fi
+  echo "===== last 25 lines of ${LOG_FILE}"
+  tail -25 "$LOG_FILE" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true
+}
+
 install_apex() {
   step "Oracle APEX ${APEX_VERSION}"
+  mkdir -p "$STATE_DIR"
   local zip="${STAGE_DIR}/apex.zip" zip_sum installed
   if [[ ! -s "$zip" ]] || [[ "$(cat "${STATE_DIR}/apex.url" 2>/dev/null)" != "$APEX_URL" ]]; then
     if ! download "$APEX_URL" "$zip"; then
@@ -364,25 +450,66 @@ install_apex() {
   installed=$(sql_value "select nvl(max(version),'NONE') from dba_registry where comp_id='APEX' and status='VALID';" || echo NONE)
   log "APEX currently in ${DB_PDB}: ${installed}"
 
+  # Keep logs of earlier APEX runs before the staging folder is replaced
+  save_apex_logs
+
   # Always unpack (needed for images even if the DB part is already there)
   rm -rf "${STAGE_DIR}/apex"
   unzip -q -o "$zip" -d "$STAGE_DIR"
   chown -R 54321:54321 "${STAGE_DIR}/apex"
+
+  # A previous failed/interrupted apexins.sql leaves a partial APEX behind;
+  # installing over it produces hundreds of errors. Remove it first.
+  if [[ "$installed" == "NONE" ]]; then
+    local partial
+    partial=$(sql_value "select (select count(*) from dba_registry where comp_id='APEX') + (select count(*) from dba_users where regexp_like(username,'^APEX_[0-9]{6}\$')) from dual;" || echo 0)
+    if [[ "${partial:-0}" != "0" ]]; then
+      warn "Found a partial APEX installation from an earlier run; removing it with apxremov.sql"
+      sqlplus_sysdba /opt/oracle/stage/apex <<SQL || true
+alter session set container=${DB_PDB};
+@apxremov.sql
+exit
+SQL
+      # Drop anything apxremov.sql could not remove
+      sqlplus_sysdba <<SQL
+whenever sqlerror exit 1
+set feedback off
+alter session set container=${DB_PDB};
+begin
+  for u in (select username from dba_users where regexp_like(username,'^APEX_[0-9]{6}\$')) loop
+    execute immediate 'drop user ' || dbms_assert.enquote_name(u.username) || ' cascade';
+  end loop;
+end;
+/
+exit
+SQL
+      ok "Partial APEX removed"
+    fi
+  fi
 
   if [[ "$installed" != "NONE" ]] && [[ "$(cat "${STATE_DIR}/apex.done" 2>/dev/null | awk '{print $1}')" == "$zip_sum" ]]; then
     log "This APEX package is already installed; skipping apexins.sql"
   elif [[ "$installed" == ${APEX_VERSION}* ]]; then
     log "APEX ${installed} already matches ${APEX_VERSION}; skipping apexins.sql"
   else
-    log "Running apexins.sql in ${DB_PDB} (usually 10-30 minutes)..."
-    sqlplus_sysdba /opt/oracle/stage/apex <<SQL
+    local free_now; free_now=$(free_gb "$ORADATA_DIR")
+    (( free_now >= 6 )) || die "Only ${free_now} GB free for database files; APEX needs about 6 GB. Free space or grow the disk, then re-run."
+    log "Running apexins.sql in ${DB_PDB} (usually 5-30 minutes, ${free_now} GB free)..."
+    log "  progress: sudo tail -f ${STATE_DIR}/apexins.out"
+    local rc=0
+    sqlplus_sysdba /opt/oracle/stage/apex > "${STATE_DIR}/apexins.out" 2>&1 <<SQL || rc=$?
 whenever sqlerror exit sql.sqlcode
 alter session set container=${DB_PDB};
 @apexins.sql SYSAUX SYSAUX TEMP /i/
 exit
 SQL
-    installed=$(sql_value "select nvl(max(version),'NONE') from dba_registry where comp_id='APEX' and status='VALID';")
-    [[ "$installed" != "NONE" ]] || die "APEX installation did not produce a VALID registry entry. Check logs in ${STAGE_DIR}/apex/*.log"
+    installed=$(sql_value "select nvl(max(version),'NONE') from dba_registry where comp_id='APEX' and status='VALID';" || echo NONE)
+    if (( rc != 0 )) || [[ "$installed" == "NONE" ]]; then
+      save_apex_logs
+      apex_failure_report "$rc"
+      die "APEX installation failed (exit ${rc}). Fix the cause above and re-run; the partial install is removed automatically."
+    fi
+    save_apex_logs
   fi
 
   if [[ "$installed" != ${APEX_VERSION}* ]]; then
@@ -770,16 +897,20 @@ uninstall() {
 main() {
   case "${1:-install}" in
     --status)    status; exit 0 ;;
+    --diagnose)
+      [[ $EUID -eq 0 ]] || die "Run as root (sudo)."
+      diagnose; exit 0 ;;
     --patch-network)
       [[ $EUID -eq 0 ]] || die "Run as root (sudo)."
-      patch_network_vllm; exit 0 ;;
-    --uninstall) uninstall "${2:-}"; exit 0 ;;
+      take_lock; patch_network_vllm; exit 0 ;;
+    --uninstall) [[ $EUID -eq 0 ]] && take_lock; uninstall "${2:-}"; exit 0 ;;
     install|--install) ;;
-    -h|--help)   sed -n '2,34p' "$0"; exit 0 ;;
+    -h|--help)   sed -n '2,32p' "$0"; exit 0 ;;
     *) die "Unknown option '$1'. Use --help." ;;
   esac
 
   [[ $EUID -eq 0 ]] || die "Run as root (sudo)."
+  take_lock
   mkdir -p "$(dirname "$LOG_FILE")"
   exec > >(tee -a "$LOG_FILE") 2>&1
   log "Starting Oracle AI Database 26ai Free + ORDS + APEX installer"

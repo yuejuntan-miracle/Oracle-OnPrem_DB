@@ -1,14 +1,34 @@
 # Oracle-OnPrem_DB
 
-Unattended installer for **Oracle AI Database 26ai Free + ORDS 26 + APEX 26.2** on Ubuntu (22.04 / 24.04, x86_64 or aarch64).
+Unattended installer for **Oracle AI Database 26ai Free + ORDS 26 + APEX 26.2** on a single local Ubuntu machine
+(22.04 – 26.04, x86_64 or aarch64), plus a network patch so APEX can call a local **vLLM**.
+
+Tested end to end on Ubuntu 26.04: DB 23.26.3 (26ai), APEX 26.2.0, ORDS 26.3, vLLM 0.33 (CPU) with Qwen3.5-0.8B.
 
 ```bash
-chmod +x install-oracle-26ai.sh
-sudo ./install-oracle-26ai.sh            # install (safe to re-run)
-sudo ./install-oracle-26ai.sh --status   # show status (incl. network ACLs)
+chmod +x install-oracle-26ai.sh setup-vllm-cpu.sh
+sudo ./install-oracle-26ai.sh                   # install (safe to re-run, resumes after a failure)
+sudo ./install-oracle-26ai.sh --status          # show status (incl. network ACLs)
 sudo ./install-oracle-26ai.sh --patch-network   # re-apply vLLM ACL + test
-sudo ./install-oracle-26ai.sh --uninstall
+sudo ./install-oracle-26ai.sh --diagnose        # print what is needed to debug a failure
+sudo ./install-oracle-26ai.sh --uninstall       # remove everything (asks first; --yes to skip)
+
+sudo ./setup-vllm-cpu.sh                        # optional: small CPU-only vLLM on 127.0.0.1:8000
 ```
+
+## Requirements
+
+| | Minimum | Notes |
+|---|---|---|
+| Disk | **25 GB free** (15 GB if the DB image is already pulled) | DB image ~9 GB, DB files + APEX ~10 GB. Running out during APEX gives `SP2-0308: cannot close spool file`. The vLLM CPU image adds ~8 GB. |
+| RAM | 4 GB for DB + ORDS; **12 GB+ with vLLM** | With 7 GB, vLLM gets swapped out and the first APEX call can time out (`ORA-29273`). |
+| CPU | x86_64 or aarch64 | vLLM CPU needs AVX2 (AVX512 is faster). |
+
+On Ubuntu's default LVM layout the root volume often doesn't use the whole disk. Check with `sudo vgs` (look at `VFree`)
+and grow it with `sudo lvextend -r -l +100%FREE /dev/ubuntu-vg/ubuntu-lv`.
+
+Only one copy of the installer runs at a time (lock file). If the APEX step fails, the half-finished APEX is removed
+automatically on the next run, and the APEX logs are kept in `/var/log/oracle-26ai/apex/`.
 
 ## Local vLLM from APEX
 
